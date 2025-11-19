@@ -1,0 +1,4 @@
+/wallets/
+/node_modules/
+/miner/
+/solver/target
