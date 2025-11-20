@@ -13,7 +13,7 @@ Unified automation for wallet lifecycle management (generation → registration 
 | Generate wallets | `npm run generate` | Defaults to 100 wallets, 1 external + 1 internal address each. |
 | Register wallets | `npm run register -- --from 1 --to 100` | Creates receipts in `wallets/registered/<id>`. |
 | Donate range | `npm run donate -- --from 10 --to 20` | Wallet 10 receives, others donate (2 s delay per donor). |
-| Start miner | `ASHMAIZE_THREADS=8 npm run start -- --from 1 --to 100 --batch 5` | Polls challenges; spawns solver batches. | (put in ASHMAIZE_THREADS equal to how many threads/cores you want to use from your pc, usually max)
+| Start miner | `ASHMAIZE_THREADS=8 npm run start -- --from 1 --to 100 --batchSize 8 --wallet-concurrency 8` | Polls challenges; spawns solver batches. | (put in ASHMAIZE_THREADS equal to how many threads/cores you want to use from your pc, usually max)
 
 Useful CLI flags:
 - `--wallet-root <path>` – change the root wallet directory.
