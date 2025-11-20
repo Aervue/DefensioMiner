@@ -559,6 +559,7 @@ async function submitWalletSolutions(wallet, challenge) {
   const challengeNumber = challenge.challenge.challenge_number || challenge.number;
   const challengeDay = challenge.challenge.day;
 
+  
   // Check if already solved
   const receipts = await loadReceipts(folder);
   if (isChallengeSolved(receipts, challengeId)) {
@@ -1273,7 +1274,7 @@ async function processWalletSolutions(wallet, challenge) {
  * Parse command line arguments
  */
 function parseArgs() {
-  const args = { from: null, to: null };
+  const args = { from: null, to: null, walletConcurrency: null };
   const argv = process.argv.slice(2);
 
   for (let i = 0; i < argv.length; i++) {
@@ -1286,17 +1287,22 @@ function parseArgs() {
       if (i + 1 < argv.length) {
         args.to = parseInt(argv[++i], 10);
       }
+    } else if (arg === '--wallet-concurrency' || arg === '--walletConcurrency' || arg === '-c') {
+      if (i + 1 < argv.length) {
+        args.walletConcurrency = parseInt(argv[++i], 10);
+      }
     } else if (arg === '--help' || arg === '-h') {
       console.log(`
 AshMaize Automation Script
 
 Usage:
-  node automate-solver.js [--from INDEX] [--to INDEX]
+  node automate-solver.js [--from INDEX] [--to INDEX] [--wallet-concurrency N]
   node automate-solver.js [START_INDEX] [END_INDEX]
 
 Options:
   --from, -f INDEX    Start processing from wallet index (1-based, inclusive)
   --to, -t INDEX      Stop processing at wallet index (1-based, inclusive)
+  --wallet-concurrency, -c N  Submit solutions for up to N wallets simultaneously (default 5)
   --help, -h          Show this help message
 
 Examples:
@@ -1331,6 +1337,20 @@ async function main() {
   
   // Parse command line arguments
   const args = parseArgs();
+  const resolveConcurrency = () => {
+    if (Number.isFinite(args.walletConcurrency) && args.walletConcurrency > 0) {
+      return Number(args.walletConcurrency);
+    }
+    const envValue = process.env.AUTOMATE_WALLET_CONCURRENCY;
+    if (envValue !== undefined && envValue !== null) {
+      const parsed = Number(envValue);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    }
+    return 5;
+  };
+  const walletConcurrency = resolveConcurrency();
 
   console.log('=== AshMaize Automation Script ===\n');
   console.log(`Started at: ${new Date().toISOString()}\n`);
@@ -1385,7 +1405,7 @@ async function main() {
   // Process wallets using batch flow (generate solutions first, then submit)
   let batchReport = null;
   try {
-    batchReport = await processWalletsBatch(solverBin, wallets, challenge, 5);
+    batchReport = await processWalletsBatch(solverBin, wallets, challenge, walletConcurrency);
   } catch (error) {
     console.error(`Error processing wallets:`, error);
   }

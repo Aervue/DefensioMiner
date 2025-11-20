@@ -38,8 +38,10 @@ const DATA_FINAL_DIR = PATHS.miningRoot;
 let RAW_START = null;
 let RAW_END = null;
 let RAW_BATCH = null;
+let RAW_WALLET_CONCURRENCY = null;
 const DEFAULT_BATCH_SIZE = 1;
 let BATCH_SIZE = DEFAULT_BATCH_SIZE;
+let WALLET_CONCURRENCY = null;
 const RECEIPT_CHECK_COUNT = Number(process.env.CHALLENGE_RECEIPT_CHECK_COUNT ?? 5);
 const RECEIPT_SCAN_VERBOSE = process.env.CHALLENGE_RECEIPT_SCAN_VERBOSE === '1';
 const CHALLENGE_URL = apiEndpoints.challenge();
@@ -421,7 +423,17 @@ const runSolverBatch = (challengeHash, batch, token) => {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(process.execPath, [SOLVER_SCRIPT, '--from', String(batch.posStart), '--to', String(batch.posEnd)], {
+      const solverArgs = [
+        SOLVER_SCRIPT,
+        '--from',
+        String(batch.posStart),
+        '--to',
+        String(batch.posEnd)
+      ];
+      if (WALLET_CONCURRENCY) {
+        solverArgs.push('--wallet-concurrency', String(WALLET_CONCURRENCY));
+      }
+      child = spawn(process.execPath, solverArgs, {
         cwd: ROOT_DIR,
         stdio: 'inherit'
       });
@@ -667,18 +679,27 @@ const runSubmitBacklogForChallenge = async (challengePath) => {
     await new Promise((resolve) => {
       let child;
       try {
-        child = spawn(process.execPath,
-          [
-            SOLVER_SCRIPT,
-            '--from', String(batch.posStart),
-            '--to', String(batch.posEnd),
-            '--challenge', challengePath,
-          ],
-          { cwd: ROOT_DIR, stdio: 'inherit', env: { ...process.env, AUTOMATE_SUBMIT_ONLY: '1' } }
-        );
+        const solverArgs = [
+          SOLVER_SCRIPT,
+          '--from',
+          String(batch.posStart),
+          '--to',
+          String(batch.posEnd),
+          '--challenge',
+          challengePath
+        ];
+        if (WALLET_CONCURRENCY) {
+          solverArgs.push('--wallet-concurrency', String(WALLET_CONCURRENCY));
+        }
+        child = spawn(process.execPath, solverArgs, {
+          cwd: ROOT_DIR,
+          stdio: 'inherit',
+          env: { ...process.env, AUTOMATE_SUBMIT_ONLY: '1' }
+        });
       } catch (error) {
         console.error(
-          `[${new Date().toISOString()}] Failed to spawn backlog submit for ${label} (wallets ${batch.labelStart}-${batch.labelEnd}):`, error
+          `[${new Date().toISOString()}] Failed to spawn backlog submit for ${label} (wallets ${batch.labelStart}-${batch.labelEnd}):`,
+          error
         );
         resolve();
         return;
@@ -1036,10 +1057,22 @@ export const startPoller = async (options = {}) => {
   RAW_START = options.startIndex ?? cliArgs.startIndex ?? process.env.AUTOMATE_SOLVER_START_INDEX;
   RAW_END = options.endIndex ?? cliArgs.endIndex ?? process.env.AUTOMATE_SOLVER_END_INDEX;
   RAW_BATCH = options.batchSize ?? cliArgs.batchSize ?? process.env.AUTOMATE_SOLVER_BATCH_SIZE;
+  RAW_WALLET_CONCURRENCY =
+    options.walletConcurrency ??
+    cliArgs.walletConcurrency ??
+    cliArgs['wallet-concurrency'] ??
+    process.env.AUTOMATE_WALLET_CONCURRENCY;
   BATCH_SIZE =
     RAW_BATCH !== undefined && RAW_BATCH !== null ? Number(RAW_BATCH) : DEFAULT_BATCH_SIZE;
   if (!Number.isFinite(BATCH_SIZE) || BATCH_SIZE <= 0) {
     BATCH_SIZE = DEFAULT_BATCH_SIZE;
+  }
+  WALLET_CONCURRENCY =
+    RAW_WALLET_CONCURRENCY !== undefined && RAW_WALLET_CONCURRENCY !== null
+      ? Number(RAW_WALLET_CONCURRENCY)
+      : null;
+  if (WALLET_CONCURRENCY !== null && (!Number.isFinite(WALLET_CONCURRENCY) || WALLET_CONCURRENCY <= 0)) {
+    WALLET_CONCURRENCY = null;
   }
 
   await main();
