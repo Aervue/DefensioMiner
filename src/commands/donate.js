@@ -117,6 +117,8 @@ export const runDonate = async (args, { paths }) => {
 
   const from = args.from ? Number(args.from) : null;
   const to = args.to ? Number(args.to) : null;
+  const manualRecipientAddress = (args.address || args.recipientAddress || '').trim();
+  const hasManualRecipient = manualRecipientAddress.length > 0;
 
   const selected = walletIds.filter((id) => {
     const numeric = Number(id);
@@ -126,28 +128,40 @@ export const runDonate = async (args, { paths }) => {
     return true;
   });
 
-  if (selected.length < 2) {
+  if (hasManualRecipient) {
+    if (!selected.length) {
+      console.log('No wallets matched the requested range to donate from.');
+      return;
+    }
+  } else if (selected.length < 2) {
     console.log('Need at least two wallets in the specified range to perform donations.');
     return;
   }
 
   const rangeStart = Number(selected[0]);
   const rangeEnd = Number(selected[selected.length - 1]);
-  const recipientId = rangeStart;
-  const donorIds = selected.slice(1).map(Number);
+  const recipientId = hasManualRecipient ? null : rangeStart;
+  const donorIds = (hasManualRecipient ? selected : selected.slice(1)).map(Number);
 
-  const recipientFolder = walletFolderPath(paths.registeredRoot, recipientId);
-  const recipientWallet = await loadWalletJson(recipientFolder);
-  const recipientAddress = extractPrimaryAddress(recipientWallet);
-  if (!recipientAddress) {
-    console.warn(`Recipient wallet ${formatWalletId(recipientId)} missing address; aborting donations.`);
-    return;
+  let recipientAddress = manualRecipientAddress || null;
+  if (!hasManualRecipient) {
+    const recipientFolder = walletFolderPath(paths.registeredRoot, recipientId);
+    const recipientWallet = await loadWalletJson(recipientFolder);
+    recipientAddress = extractPrimaryAddress(recipientWallet);
+    if (!recipientAddress) {
+      console.warn(`Recipient wallet ${formatWalletId(recipientId)} missing address; aborting donations.`);
+      return;
+    }
   }
+
+  const recipientLabel = hasManualRecipient
+    ? `external address (${recipientAddress.slice(0, 48)}...)`
+    : `${formatWalletId(recipientId)} (${recipientAddress.slice(0, 32)}...)`;
 
   console.log(
     `Donating from ${donorIds.length} wallet(s) in range ${formatWalletId(rangeStart)}-${formatWalletId(
       rangeEnd
-    )} to ${formatWalletId(recipientId)} (${recipientAddress.slice(0, 32)}...)`
+    )} to ${recipientLabel}`
   );
 
   for (const donorId of donorIds) {

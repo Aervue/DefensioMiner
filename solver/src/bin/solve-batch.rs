@@ -85,6 +85,14 @@ impl SolverParameters {
             solutions_per_batch,
         }
     }
+
+    fn log_interval(&self) -> Option<Duration> {
+        if self.log_interval_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.log_interval_ms))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -545,6 +553,26 @@ fn solve_with_rom(
 
     drop(result_tx);
 
+    let logger = if let Some(interval) = params.log_interval() {
+        let log_found = Arc::clone(&stop_flag);
+        let log_hashes = Arc::clone(&total_hashes);
+        let log_start = search_start;
+        Some(thread::spawn(move || {
+            while !log_found.load(Ordering::Acquire) {
+                thread::sleep(interval);
+                let hashes = log_hashes.load(Ordering::Relaxed) as u128;
+                if hashes == 0 {
+                    continue;
+                }
+                let elapsed = log_start.elapsed().as_secs_f64().max(1e-6);
+                let rate = hashes as f64 / elapsed;
+                println!("Checked {:>15} salts — {:>8.2} H/s", hashes, rate);
+            }
+        }))
+    } else {
+        None
+    };
+
     let mut collected = Vec::with_capacity(desired);
     while collected.len() < desired {
         match result_rx.recv() {
@@ -557,6 +585,9 @@ fn solve_with_rom(
 
     for worker in workers {
         let _ = worker.join();
+    }
+    if let Some(logger) = logger {
+        let _ = logger.join();
     }
 
     let total_hashes_final = total_hashes.load(Ordering::Relaxed) as u128;

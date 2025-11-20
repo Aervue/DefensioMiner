@@ -9,11 +9,11 @@ Unified automation for wallet lifecycle management (generation → registration 
 | Step | Command | Notes |
 | --- | --- | --- |
 | Install deps | `npm install` | Installs Node dependencies. |
-| Build solver | `cd solver && cargo build --release` | Requires Rust toolchain. |
+| Build solver | `npm run build:solver` | auto-tunes `RUSTFLAGS` per CPU. |
 | Generate wallets | `npm run generate` | Defaults to 100 wallets, 1 external + 1 internal address each. |
 | Register wallets | `npm run register -- --from 1 --to 100` | Creates receipts in `wallets/registered/<id>`. |
 | Donate range | `npm run donate -- --from 10 --to 20` | Wallet 10 receives, others donate (2 s delay per donor). |
-| Start miner | `ASHMAIZE_THREADS=8 npm run start -- --from 1 --to 100 --batchSize 8 --wallet-concurrency 8` | Polls challenges; spawns solver batches. | (put in ASHMAIZE_THREADS equal to how many threads/cores you want to use from your pc, usually max)
+| Start miner | `ASHMAIZE_THREADS=8 npm run start -- --from 1 --to 100 --batch 8 --wallet-concurrency 8` | Polls challenges; spawns solver batches. | (ASHMAIZE_THREADS = physical cores/threads you want to use)
 
 Useful CLI flags:
 - `--wallet-root <path>` – change the root wallet directory.
@@ -37,6 +37,7 @@ Optional environment overrides:
 - `DEFENSIO_WALLET_ROOT` → custom wallets directory (defaults to `<repo>/wallets`).
 - `DEFENSIO_API_BASE` → alternate API base; trailing slash removed automatically.
 - `DEFENSIO_NETWORK` → default Cardano network (`mainnet`, `preprod`, `preview`, `sanchonet`).
+- `TARGET_FEATURES` → overrides auto-detected `-C target-feature` when building the solver.
 
 ### 2. Project Layout
 
@@ -71,17 +72,35 @@ cd defensio-main
 # Install JS dependencies
 npm install
 
-# Build solver binaries
-cd solver
-cargo build --release
-cd ..
+# Build solver binaries (auto-optimized for your CPU)
+npm run build:solver
+
+# (optional) Traditional build
+cd solver && cargo build --release && cd ..
 ```
+
+`npm run build:solver` wraps `cargo build --release` with CPU-specific `RUSTFLAGS`:
+
+- `-C target-cpu=native` plus `target-feature` bundles tuned for each platform:
+  - x86_64: AES/SSE2+/AVX/AVX2/FMA
+  - ia32: MMX/SSE through SSE4.2
+  - ARM/ARM64: NEON + crypto/CRC/dotprod/FP16 where available
+  - RISC-V (riscv64): MAFD + Zba/Zbb/Zbc extensions
+- `-C llvm-args=--inline-threshold=1000`, `-C prefer-dynamic=no`, and `-C link-arg=-s` (non-Windows) to keep binaries small and fast.
+
+To experiment with different instruction sets, override via `TARGET_FEATURES="+avx512f,+vpclmulqdq"` (comma separated). Unsupported flags (e.g., link stripping on Windows) are skipped automatically. If you prefer manual control, run the plain cargo command instead.
 
 The CLI automatically uses the release binary in `solver/target/release/solve`. Debug builds are used only if release is missing.
 
 ### 4. CLI Commands
 
 Run via `node ./src/cli.js <command>` or `npm run <script>`. Use `--` when passing flags through npm.
+
+Global CLI flags (available on every subcommand):
+
+- `--wallet-root <path>` – override where generated/registered/mining wallets live (defaults to `wallets/`).
+- `--api-base <url>` – point at a different API endpoint (defaults to `https://mine.defensio.io/api`).
+- `--network <name>` – override Cardano network (`mainnet`, `preprod`, `preview`, `sanchonet`).
 
 #### Wallet Generation
 
@@ -111,17 +130,19 @@ npm run register -- --from 1 --to 50 --force
 
 ```bash
 npm run donate -- --from 10 --to 20
+npm run donate -- --from 10 --to 20 --address addr1q...
 ```
 
 - Filters registered wallets by ID range.
-- First wallet in the range is the recipient; others donate sequentially.
+- Default behavior: first wallet in the range is the recipient; others donate sequentially.
+- Pass `--address <paymentAddress>` to donate the entire range directly to an external recipient instead.
 - 2000 ms delay between donors to avoid API bursts.
 - Logs stored as `wallets/donors/<donorId>.json`.
 
 #### Mining Automation (`start`)
 
 ```bash
-npm run start -- --from 1 --to 100 --batch 5
+npm run start -- --from 1 --to 100 --batch 5 --wallet-concurrency 5
 ```
 
 - Launches `src/miner/poll.js`, which polls `https://mine.defensio.io/api/challenge`.
@@ -129,8 +150,11 @@ npm run start -- --from 1 --to 100 --batch 5
 
 Flags:
 
-- `--from`, `--to` – specify which wallet IDs to use for mining.
-- `--batch` – how many wallets per solver batch (default 1).
+- `--from`, `--to` – wallet ID range for mining.
+- `--batch` (`--batchSize`) – wallets per solver batch (default `1`). Larger values keep more wallets busy but increase per-run memory requirements.
+- `--wallet-concurrency` – how many wallets `automate-solver` should submit in parallel inside each batch (default `5`). This controls HTTP submission fan-out; keep it aligned with your API limits.
+- `--challenge` – pass a cached challenge JSON path to replay submissions manually.
+- `--help` – prints command usage.
 
 Environment variables for solver tuning:
 
@@ -147,10 +171,9 @@ Miner-specific overrides:
 - `CHALLENGE_POLL_INTERVAL_MS` – how often to poll the challenge endpoint.
 - `FAST_BACKLOG_BLOCK`, `FAST_BACKLOG_TIMEOUT_MS` – backlog submission gating.
 - `AUTOMATE_SOLVER_START_INDEX`, `AUTOMATE_SOLVER_END_INDEX`, `AUTOMATE_SOLVER_BATCH_SIZE` – environment-based start overrides.
-
-Diagnostics:
-
-- `DIAGNOSTICS_ENABLED` (default `1`) and `DIAGNOSTICS_BASE_URL` control optional reporting to `https://mine.defensio.io/api/diagnostics`.
+- `AUTOMATE_WALLET_CONCURRENCY` – sets a default for `--wallet-concurrency` so you don’t have to pass it each time.
+- `AUTOMATE_SOLVER_RAW_LOGS=1` – emits the raw `solve-batch` stdout/stderr for debugging.
+- `AUTOMATE_SUBMIT_ONLY=1` – skips solution generation and only re-submits cached solutions.
 
 ### 5. Running End-to-End
 

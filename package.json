@@ -11,7 +11,8 @@
     "start": "node ./src/cli.js start",
     "generate": "node ./src/cli.js generate --count 100 --external 1 --internal 1",
     "register": "node ./src/cli.js register",
-    "donate": "node ./src/cli.js donate"
+    "donate": "node ./src/cli.js donate",
+    "build:solver": "node ./scripts/build-solver.js"
   },
   "dependencies": {
     "@cardano-sdk/core": "^0.46.10",

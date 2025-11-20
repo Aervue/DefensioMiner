@@ -10,9 +10,9 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
-import { exec } from 'node:child_process';
+import { spawn, exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import chalk from 'chalk';
 import { resolvePaths, apiEndpoints } from '../config/index.js';
 
 const execAsync = promisify(exec);
@@ -25,128 +25,6 @@ const DATA_FINAL_DIR = PATHS.miningRoot;
 const CHALLENGES_DIR = PATHS.challengeCache;
 const SOLUTIONS_BASE_DIR = PATHS.solutionsRoot;
 // Receipts are now per-wallet: data_final/{wallet_folder}/challenge_receipt.json
-
-const DEFAULT_DIAGNOSTICS_BASE_URL = 'http://127.0.0.1:3000/api/diagnostics';
-const DIAGNOSTICS_BASE_URL = (() => {
-  const raw = process.env.DIAGNOSTICS_BASE_URL ?? DEFAULT_DIAGNOSTICS_BASE_URL;
-  return typeof raw === 'string' ? raw.replace(/\/$/, '') : DEFAULT_DIAGNOSTICS_BASE_URL;
-})();
-const DIAGNOSTICS_ENABLED = process.env.DIAGNOSTICS_ENABLED !== '0';
-const SOURCE_SERVER_IP = process.env.SOURCE_SERVER_IP ?? process.env.DIAGNOSTICS_SOURCE_IP ?? null;
-
-function resolveSourceServerIp() {
-  if (SOURCE_SERVER_IP && SOURCE_SERVER_IP.trim().length > 0) {
-    return SOURCE_SERVER_IP.trim();
-  }
-
-  const interfaces = os.networkInterfaces();
-  for (const ifaceRecords of Object.values(interfaces)) {
-    for (const record of ifaceRecords ?? []) {
-      if (!record) continue;
-      const family = typeof record.family === 'string' ? record.family : record.family?.toString();
-      if ((family === 'IPv4' || family === '4') && !record.internal && record.address) {
-        return record.address;
-      }
-    }
-  }
-
-  return null;
-}
-
-const toFiniteNumber = (value, fallback = 0) => {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : fallback;
-};
-
-const buildDiagnosticsPayload = (report, challengeData, timestampSeconds) => {
-  if (!report?.results) {
-    return null;
-  }
-
-  const success = toFiniteNumber(report.results.success, 0);
-  if (success <= 0) {
-    return null;
-  }
-
-  const skipped = toFiniteNumber(report.results.skipped, 0);
-  const failed = toFiniteNumber(report.results.failed, 0);
-  const generationMs = toFiniteNumber(report.timings?.generationMs, 0);
-  const submissionMs = toFiniteNumber(report.timings?.submissionMs, 0);
-
-  const challengeId =
-    challengeData?.challenge_id ??
-    challengeData?.challengeId ??
-    (Number.isFinite(Number(challengeData?.challenge_number))
-      ? `challenge-${Number(challengeData.challenge_number)}`
-      : null);
-
-  return {
-    solutions: {
-      succeded: success,
-      skipped,
-      failed,
-    },
-    currentChallenge: challengeId ?? 'unknown',
-    timeSpentGeneration: generationMs,
-    timeSpentSubmission: submissionMs,
-    timeStamp: toFiniteNumber(timestampSeconds, Math.floor(Date.now() / 1000)),
-    dataDir: process.env.ASHMAIZE_DATA_DIR ?? DATA_FINAL_DIR,
-  };
-};
-
-async function sendDiagnosticsReport(report, challengeData, timestampSeconds) {
-  if (!DIAGNOSTICS_ENABLED) {
-    return false;
-  }
-
-  const payload = buildDiagnosticsPayload(report, challengeData, timestampSeconds);
-  if (!payload) {
-    console.log(
-      `[${new Date().toISOString()}] Diagnostics POST skipped: no successful solutions to report.`
-    );
-    return false;
-  }
-
-  const sourceIp = resolveSourceServerIp();
-  if (!sourceIp) {
-    console.warn(
-      `[${new Date().toISOString()}] Unable to determine source server IP; skipping diagnostics POST.`
-    );
-    return false;
-  }
-
-  const url = `${DIAGNOSTICS_BASE_URL}/${encodeURIComponent(sourceIp)}`;
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      let responseText = '';
-      try {
-        responseText = await response.text();
-      } catch {
-        // Ignore extraction failures
-      }
-
-      console.warn(
-        `[${new Date().toISOString()}] Diagnostics POST failed (${response.status} ${response.statusText}): ${responseText}`
-      );
-      return false;
-    }
-
-    console.log(
-      `[${new Date().toISOString()}] Diagnostics POST succeeded (${response.status}) to ${url}`
-    );
-    return true;
-  } catch (error) {
-    console.warn(`[${new Date().toISOString()}] Diagnostics POST error: ${error.message}`);
-    return false;
-  }
-}
 
 async function isElfExecutable(filePath) {
   let handle;
@@ -172,12 +50,20 @@ async function findSolverBinary(binaryName = 'solve') {
   const releaseBin = path.join(SOLVER_ROOT, 'target', 'release', binaryName);
   const debugBin = path.join(SOLVER_ROOT, 'target', 'debug', binaryName);
 
+  const asDescriptor = (command, args = []) => ({
+    command,
+    args,
+    label: args.length ? `${command} ${args.join(' ')}` : command
+  });
+
   try {
     await fs.access(releaseBin);
     if (await isElfExecutable(releaseBin)) {
-      return releaseBin;
+      return asDescriptor(releaseBin);
     }
-    console.warn(`Warning: Release binary '${releaseBin}' is not a Linux ELF executable. Trying debug build...`);
+    console.warn(
+      `Warning: Release binary '${releaseBin}' is not a Linux ELF executable. Trying debug build...`
+    );
   } catch {
     // Ignore and try debug build
   }
@@ -186,7 +72,7 @@ async function findSolverBinary(binaryName = 'solve') {
     await fs.access(debugBin);
     if (await isElfExecutable(debugBin)) {
       console.warn(`Warning: Using debug build instead of release build`);
-      return debugBin;
+      return asDescriptor(debugBin);
     }
     console.warn(`Warning: Debug binary '${debugBin}' is not a Linux ELF executable.`);
   } catch {
@@ -194,7 +80,7 @@ async function findSolverBinary(binaryName = 'solve') {
   }
 
   console.warn(`Falling back to running '${binaryName}' via cargo. This may trigger a compilation step.`);
-  return `cargo run --release --bin ${binaryName} --`;
+  return asDescriptor('cargo', ['run', '--release', '--bin', binaryName, '--']);
 }
 
 const SUBMIT_URL_BASE = apiEndpoints.solution();
@@ -214,6 +100,117 @@ const REQUEST_HEADERS = {
   accept:
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
   'content-type': 'application/json',
+};
+
+const numberFormatter = new Intl.NumberFormat('en-US');
+const formatNumber = (value) => {
+  if (value === null || value === undefined) return '–';
+  return numberFormatter.format(Math.round(value));
+};
+
+const formatDuration = (ms) => {
+  if (!Number.isFinite(ms)) return '–';
+  if (ms < 1000) return `${ms.toFixed(0)}ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(2)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = (seconds % 60).toFixed(1);
+  return `${minutes}m ${remainingSeconds}s`;
+};
+
+const formatHashRate = (rate) => {
+  if (!Number.isFinite(rate) || rate <= 0) return '–';
+  if (rate >= 1_000_000) return `${(rate / 1_000_000).toFixed(2)} MH/s`;
+  if (rate >= 1_000) return `${(rate / 1_000).toFixed(2)} kH/s`;
+  return `${rate.toFixed(2)} H/s`;
+};
+
+const shortAddress = (address = '', keep = 6) => {
+  if (!address || address.length <= keep * 2 + 1) return address || 'unknown';
+  return `${address.slice(0, keep)}…${address.slice(-keep)}`;
+};
+
+const formatNonce = (nonce) => {
+  if (!nonce) return 'n/a';
+  if (nonce.length <= 8) return nonce;
+  return `${nonce.slice(0, 4)}…${nonce.slice(-4)}`;
+};
+
+const logSection = (title, rows) => {
+  const normalizedRows = rows.filter(Boolean);
+  if (!normalizedRows.length) return;
+  console.log(`\n${chalk.bold.cyan(title)}`);
+  for (const [label, value] of normalizedRows) {
+    console.log(`${chalk.gray('  •')} ${chalk.dim(label)} ${chalk.white(value)}`);
+  }
+};
+
+const clearActiveLine = () => {
+  process.stdout.write('\r\x1B[K');
+};
+
+const createTicker = (label) => {
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let frameIndex = 0;
+  let extra = '';
+  const start = Date.now();
+  const render = () => {
+    const message = `${chalk.yellow(frames[frameIndex])} ${chalk.white(label)} ${chalk.gray(
+      formatDuration(Date.now() - start)
+    )}${extra ? chalk.gray(' · ') + extra : ''}`;
+    clearActiveLine();
+    process.stdout.write(message);
+    frameIndex = (frameIndex + 1) % frames.length;
+  };
+  const timer = setInterval(render, 120);
+  render();
+  return {
+    update(text) {
+      extra = text;
+    },
+    stop(finalMessage) {
+      clearInterval(timer);
+      clearActiveLine();
+      if (finalMessage) {
+        console.log(finalMessage);
+      }
+    }
+  };
+};
+
+const quoteArg = (value = '') => {
+  if (/^[A-Za-z0-9._\-/:=+]+$/.test(value)) {
+    return value;
+  }
+  return `"${value.replace(/(["\\$`])/g, '\\$1')}"`;
+};
+
+const buildCommandString = (descriptor, extraArgs = []) => {
+  const parts = [descriptor.command, ...(descriptor.args ?? []), ...extraArgs];
+  return parts.map(quoteArg).join(' ');
+};
+
+const extractSolutionMetrics = (solution) => {
+  if (!solution) {
+    return { hashRate: null, totalHashes: null, elapsedMs: null };
+  }
+  const elapsedSeconds = Number(solution.elapsed_seconds ?? solution.elapsedSeconds);
+  let totalHashes = solution.total_hashes ?? solution.totalHashes ?? solution.hashes;
+  totalHashes =
+    typeof totalHashes === 'string'
+      ? Number(totalHashes.replace(/_/g, ''))
+      : Number(totalHashes);
+  let hashRate = Number(solution.hash_rate_hs ?? solution.hashRateHs ?? solution.hash_rate);
+  if ((!Number.isFinite(hashRate) || hashRate <= 0) && Number.isFinite(totalHashes) && Number.isFinite(elapsedSeconds) && elapsedSeconds > 0) {
+    hashRate = totalHashes / elapsedSeconds;
+  }
+  const elapsedMs =
+    Number.isFinite(elapsedSeconds) && elapsedSeconds >= 0 ? elapsedSeconds * 1000 : null;
+  return {
+    hashRate: Number.isFinite(hashRate) ? hashRate : null,
+    totalHashes: Number.isFinite(totalHashes) ? totalHashes : null,
+    elapsedMs
+  };
 };
 
 /**
@@ -313,8 +310,9 @@ async function getCurrentChallenge() {
  * Run solver for a single wallet
  */
 async function runSolver(solverBin, walletAddress, challengePath, suffixOffset = null) {
-  let command = `${solverBin} --address "${walletAddress}" "${challengePath}"`;
-  
+  const extraArgs = ['--address', walletAddress, challengePath];
+  const command = buildCommandString(solverBin, extraArgs);
+
   const env = { ...process.env, WALLET_ADDRESS: walletAddress };
   
   // If suffixOffset is provided, set it in environment to start from a different point
@@ -412,40 +410,105 @@ async function getSolutionFiles(challengeMeta, walletAddress) {
  * Run batch solver to generate solutions for all wallets
  */
 async function runBatchSolver(solverBin, walletAddresses, challengePath, solutionsDir) {
-  // Create temporary file with addresses
   const tempFile = path.join(SOLVER_ROOT, `.batch_addresses_${Date.now()}.txt`);
   try {
     await fs.writeFile(tempFile, walletAddresses.join('\n') + '\n', 'utf8');
-    
-    const command = `${solverBin} --addresses "${tempFile}" --solutions-dir "${solutionsDir}" "${challengePath}"`;
-    console.log(`Running batch solver for ${walletAddresses.length} wallet(s)...`);
-
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        cwd: SOLVER_ROOT,
-        maxBuffer: 50 * 1024 * 1024, // 50MB buffer
-      });
-
-      if (stderr && !stderr.includes('Building ROM') && !stderr.includes('Using cached ROM')) {
-        console.error(`Batch solver stderr:`, stderr);
-      }
-
-      return { success: true, stdout, stderr };
-    } catch (error) {
-      console.error(`Batch solver failed:`, error.message);
-      return { success: false, error: error.message };
-    } finally {
-      // Clean up temp file
-      try {
-        await fs.unlink(tempFile);
-      } catch (err) {
-        // Ignore cleanup errors
-      }
-    }
   } catch (error) {
     console.error(`Failed to create addresses file:`, error.message);
     return { success: false, error: error.message };
   }
+
+  const ticker = createTicker('hashing');
+  let lastRate = null;
+  const updateRate = (rate) => {
+    if (!Number.isFinite(rate) || rate <= 0) return;
+    lastRate = rate;
+    ticker.update(chalk.blue(formatHashRate(rate)));
+  };
+  const args = [
+    ...(solverBin.args ?? []),
+    '--addresses',
+    tempFile,
+    '--solutions-dir',
+    solutionsDir,
+    challengePath
+  ];
+
+  return await new Promise((resolve) => {
+    const child = spawn(solverBin.command, args, {
+      cwd: SOLVER_ROOT,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stdoutBuffer = '';
+    let solverResult = null;
+
+    const handleLine = (line) => {
+      const progressMatch = line.match(/Checked\s+([\d,]+)\s+salts\s+—\s+([0-9.]+)\s+H\/s/i);
+      if (progressMatch) {
+        const rate = Number(progressMatch[2]);
+        updateRate(rate);
+        return;
+      }
+      const resultMatch = line.match(/AUTOMATE_SOLVER_RESULT\s+(.*)$/);
+      if (resultMatch) {
+        try {
+          solverResult = JSON.parse(resultMatch[1]);
+          const hr =
+            solverResult?.performance?.totalHashRate ??
+            solverResult?.performance?.hash_rate_hs ??
+            solverResult?.hash_rate_hs ??
+            solverResult?.hashRateHs ??
+            null;
+          updateRate(hr);
+        } catch {
+          // ignore parse errors
+        }
+      }
+    };
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      if (process.env.AUTOMATE_SOLVER_RAW_LOGS === '1') {
+        process.stdout.write(chalk.dim(text));
+      }
+      stdoutBuffer += text;
+      let newlineIndex;
+      while ((newlineIndex = stdoutBuffer.indexOf('\n')) >= 0) {
+        const line = stdoutBuffer.slice(0, newlineIndex).trim();
+        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+        if (line.length) {
+          handleLine(line);
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      if (process.env.AUTOMATE_SOLVER_RAW_LOGS === '1') {
+        process.stderr.write(chalk.dim(chunk.toString()));
+      }
+    });
+
+    const finalize = async (result) => {
+      const finalMessage = result.success
+        ? `${chalk.green('✓')} hashing ${chalk.gray(formatHashRate(lastRate))}`
+        : `${chalk.red('✖')} solver failed${result.error ? `: ${result.error}` : ''}`;
+      ticker.stop(finalMessage.trim());
+      try {
+        await fs.unlink(tempFile);
+      } catch {}
+      resolve({ ...result, solverResult });
+    };
+
+    child.on('error', (error) => {
+      finalize({ success: false, error: error.message });
+    });
+
+    child.on('exit', (code) => {
+      finalize({ success: code === 0 });
+    });
+  });
 }
 
 /**
@@ -453,7 +516,7 @@ async function runBatchSolver(solverBin, walletAddresses, challengePath, solutio
  */
 async function submitSolution(address, challengeId, nonce) {
   const url = `${SUBMIT_URL_BASE}/${address}/${challengeId}/${nonce}`;
-  console.log(`Submitting: POST ${url}`);
+  console.log(`→ Submitting ${shortAddress(address, 10)} · nonce ${formatNonce(nonce)}`);
 
   try {
     const response = await fetch(url, {
@@ -567,10 +630,13 @@ async function submitWalletSolutions(wallet, challenge) {
   }
 
   // Get solutions for this wallet for the current challenge only (by id or by day+number)
-  const solutions = await getSolutionFiles({ id: challengeId, day: challengeDay, number: challengeNumber }, address);
+  const solutions = await getSolutionFiles(
+    { id: challengeId, day: challengeDay, number: challengeNumber },
+    address
+  );
   
   if (solutions.length === 0) {
-    return { skipped: true, reason: 'no solutions found' };
+    return { skipped: true, reason: 'no solutions found', walletAddress: address };
   }
 
   // Build a set of already-submitted salts (nonces) for this challenge to avoid duplicates
@@ -602,6 +668,18 @@ async function submitWalletSolutions(wallet, challenge) {
     if (!nonce) {
       continue; // Try next solution
     }
+
+    if (!solution) {
+      try {
+        const solutionContent = await fs.readFile(item.file, 'utf8');
+        solution = JSON.parse(solutionContent);
+      } catch (error) {
+        console.warn(`Failed to read solution file ${item.file}: ${error.message}`);
+        continue;
+      }
+    }
+
+    const metrics = extractSolutionMetrics(solution);
 
     const salt = nonce.toLowerCase();
     if (submittedSalts.has(salt)) {
@@ -673,16 +751,21 @@ async function submitWalletSolutions(wallet, challenge) {
       await saveReceipts(folder, receipts);
       submittedSalts.add(salt);
       
-      return { 
-        success: true, 
+      return {
+        success: true,
         status: apiReceipt.status,
-        validated: apiReceipt.status === 'validated'
+        validated: apiReceipt.status === 'validated',
+        hashRate: metrics.hashRate,
+        totalHashes: metrics.totalHashes,
+        elapsedMs: metrics.elapsedMs,
+        walletAddress: address,
+        nonce
       };
     }
     // If submission failed, continue to next solution
   }
 
-  return { skipped: true, reason: 'all solutions failed' };
+  return { skipped: true, reason: 'all solutions failed', errors: failureDetails, walletAddress: address };
 }
 
 /**
@@ -691,27 +774,30 @@ async function submitWalletSolutions(wallet, challenge) {
 async function processWalletsBatch(solverBin, wallets, challenge, concurrency = 5) {
   const challengeId = challenge.challenge.challenge_id || challenge.challenge.challengeId;
   const challengeNumber = challenge.challenge.challenge_number || challenge.number;
+  const challengeDay = challenge.challenge.day ?? 'n/a';
 
-  console.log(`\n=== Batch Processing ${wallets.length} wallet(s) ===`);
-  console.log(`Challenge: ${challengeId} (${challengeNumber})`);
+  console.log(
+    `\n${chalk.bgMagenta.black(' CHALLENGE ')} ${chalk.magenta(challengeId)} ${chalk.gray(
+      `day ${challengeDay} · #${challengeNumber}`
+    )}`
+  );
+  logSection('Batch', [
+    ['Wallets requested', `${wallets.length}`],
+    ['Concurrency', concurrency.toString()]
+  ]);
 
-  const timings = {
-    generationMs: 0,
-    submissionMs: 0,
-  };
+  const timings = { generationMs: 0, submissionMs: 0 };
 
-  // Filter out wallets that are already solved
   const walletsToProcess = [];
   for (const wallet of wallets) {
     const receipts = await loadReceipts(wallet.folder);
-    // Skip any wallet that already has a receipt entry for this challenge (any status)
     if (!hasReceiptForChallenge(receipts, challengeId)) {
       walletsToProcess.push(wallet);
     }
   }
 
-  if (walletsToProcess.length === 0) {
-    console.log(`All wallets already solved for challenge ${challengeId}`);
+  if (!walletsToProcess.length) {
+    console.log(chalk.green('✓ Nothing to do — every wallet already has a receipt for this challenge.'));
     return {
       results: { success: 0, skipped: wallets.length, failed: 0, validated: 0 },
       timings,
@@ -719,154 +805,203 @@ async function processWalletsBatch(solverBin, wallets, challenge, concurrency = 
         walletsWithSolutions: wallets.length,
         walletsNeedingGeneration: 0,
         walletsForSubmit: 0,
+        walletConcurrency: concurrency,
+        totalHashRate: 0,
+        avgHashRate: null,
+        peakHashRate: null,
+        totalHashes: 0,
+        didWork: false
       }
     };
   }
 
-  console.log(`Processing ${walletsToProcess.length} wallet(s) that need solutions...`);
+  console.log(
+    `${chalk.gray('→ pending')} ${chalk.white(walletsToProcess.length)} ${chalk.gray(
+      `(${wallets.length - walletsToProcess.length} already solved)`
+    )}`
+  );
 
-  // Determine which wallets already have at least one solution file for this challenge
-  const challengeMeta = { id: challengeId, day: challenge.challenge.day, number: challengeNumber };
+  const challengeMeta = { id: challengeId, day: challengeDay, number: challengeNumber };
   const withSolutionsChecks = await Promise.all(
-    walletsToProcess.map(async (w) => {
-      const sols = await getSolutionFiles(challengeMeta, w.address);
-      return { wallet: w, has: sols.length > 0 };
+    walletsToProcess.map(async (wallet) => {
+      const sols = await getSolutionFiles(challengeMeta, wallet.address);
+      return { wallet, has: sols.length > 0 };
     })
   );
-  const walletsWithSolutions = withSolutionsChecks.filter(x => x.has).map(x => x.wallet);
-  const walletsNeedingGen = withSolutionsChecks.filter(x => !x.has).map(x => x.wallet);
-
+  const walletsWithSolutions = withSolutionsChecks.filter((x) => x.has).map((x) => x.wallet);
+  const walletsNeedingGen = withSolutionsChecks.filter((x) => !x.has).map((x) => x.wallet);
   const submitOnly = process.env.AUTOMATE_SUBMIT_ONLY === '1';
 
   let step1Duration = 0;
   if (!submitOnly && walletsNeedingGen.length > 0) {
-    console.log(`\n[Step 1/2] Generating solutions for ${walletsNeedingGen.length} wallet(s)...`);
+    console.log(`\n${chalk.yellow('⛏')} Generating solutions for ${walletsNeedingGen.length} wallet(s)...`);
     const step1StartTime = Date.now();
-    const addresses = walletsNeedingGen.map(w => w.address);
-    const batchSolverResult = await runBatchSolver(solverBin, addresses, challenge.path, SOLUTIONS_BASE_DIR);
+    const addresses = walletsNeedingGen.map((w) => w.address);
+    const batchSolverResult = await runBatchSolver(
+      solverBin,
+      addresses,
+      challenge.path,
+      SOLUTIONS_BASE_DIR
+    );
     const step1EndTime = Date.now();
     step1Duration = step1EndTime - step1StartTime;
     timings.generationMs = step1Duration;
-    const step1Seconds = (step1Duration / 1000).toFixed(2);
-    const step1Minutes = Math.floor(step1Duration / 60000);
-    const step1RemainingSeconds = ((step1Duration % 60000) / 1000).toFixed(2);
-
     if (!batchSolverResult.success) {
-      console.error(`Batch solver failed, cannot proceed with submissions`);
+      console.error('✖ Batch solver failed during generation. Aborting submissions for this batch.');
       return {
         results: {
           success: 0,
           skipped: walletsNeedingGen.length,
           failed: walletsNeedingGen.length,
-          validated: 0,
+          validated: 0
         },
         timings,
         meta: {
           walletsWithSolutions: walletsWithSolutions.length,
           walletsNeedingGeneration: walletsNeedingGen.length,
           walletsForSubmit: walletsWithSolutions.length,
+          walletConcurrency: concurrency,
+          totalHashRate: 0,
+          avgHashRate: null,
+          peakHashRate: null,
+          totalHashes: 0
         }
       };
     }
-
-    if (step1Minutes > 0) {
-      console.log(`Solutions generated successfully in ${step1Minutes}m ${step1RemainingSeconds}s (${step1Duration}ms)\n`);
-    } else {
-      console.log(`Solutions generated successfully in ${step1Seconds}s (${step1Duration}ms)\n`);
-    }
+    console.log(`${chalk.green('✔')} Generation finished in ${chalk.white(formatDuration(step1Duration))}`);
   } else {
-    console.log(`\n[Step 1/2] Skipping generation: ${walletsWithSolutions.length} wallet(s) already have solutions.`);
+    console.log(
+      `\n${chalk.yellow('⛏')} Generation skipped — ${walletsWithSolutions.length} wallet(s) already have cached solutions.`
+    );
   }
 
-  // Step 2: Submit solutions for all wallets concurrently
-  // Union of wallets with existing solutions and those just generated
-  const walletsForSubmit = walletsWithSolutions.length > 0 || walletsNeedingGen.length > 0
-    ? walletsWithSolutions.concat(walletsNeedingGen)
-    : walletsToProcess;
+  const walletsForSubmit =
+    walletsWithSolutions.length > 0 || walletsNeedingGen.length > 0
+      ? walletsWithSolutions.concat(walletsNeedingGen)
+      : walletsToProcess;
 
   const meta = {
     walletsWithSolutions: walletsWithSolutions.length,
     walletsNeedingGeneration: walletsNeedingGen.length,
     walletsForSubmit: walletsForSubmit.length,
+    walletConcurrency: concurrency,
+    didWork: true
   };
 
-  console.log(`[Step 2/2] Submitting solutions for ${walletsForSubmit.length} wallet(s)...`);
-  const step2StartTime = Date.now();
-  const results = {
-    success: 0,
-    skipped: 0,
-    failed: 0,
-    validated: 0
+  console.log(
+    `\n${chalk.cyan('🚀')} Submitting ${walletsForSubmit.length} wallet(s) ${chalk.gray(
+      `(concurrency ${concurrency})`
+    )}`
+  );
+
+  const performance = {
+    totalHashRate: 0,
+    totalHashes: 0,
+    countedHashRates: 0,
+    peakHashRate: 0
   };
+
+  const step2StartTime = Date.now();
+  const results = { success: 0, skipped: 0, failed: 0, validated: 0 };
   const skipReasons = new Map();
 
-  // Process wallets in batches with concurrency limit
   for (let i = 0; i < walletsForSubmit.length; i += concurrency) {
     const batch = walletsForSubmit.slice(i, i + concurrency);
-    const batchPromises = batch.map(wallet => submitWalletSolutions(wallet, challenge));
-    const batchResults = await Promise.all(batchPromises);
+    const batchResults = await Promise.all(batch.map((wallet) => submitWalletSolutions(wallet, challenge)));
 
     for (let j = 0; j < batchResults.length; j++) {
       const result = batchResults[j];
       const wallet = batch[j];
-      
+      const label = shortAddress(wallet.address, 10);
+
       if (result.success) {
-        results.success++;
-        if (result.validated) {
-          results.validated++;
+        results.success += 1;
+        if (result.validated) results.validated += 1;
+
+        if (Number.isFinite(result.hashRate) && result.hashRate > 0) {
+          performance.totalHashRate += result.hashRate;
+          performance.countedHashRates += 1;
+          performance.peakHashRate = Math.max(performance.peakHashRate, result.hashRate);
         }
-        // Don't log individual submissions - only show summary at end
+        if (Number.isFinite(result.totalHashes)) {
+          performance.totalHashes += result.totalHashes;
+        }
+
+        const hashRateLabel = formatHashRate(result.hashRate);
+        const durationLabel = formatDuration(result.elapsedMs);
+        const statusIcon = result.validated ? chalk.green('🏁') : chalk.green('✅');
+        console.log(
+          `${statusIcon} ${chalk.white(label)} ${chalk.gray(`nonce ${formatNonce(result.nonce)}`)} ${chalk.blue(
+            hashRateLabel
+          )} ${chalk.gray(durationLabel)}`
+        );
       } else if (result.skipped) {
-        results.skipped++;
-        // Collect reason breakdown and optionally log
+        results.skipped += 1;
         const reason = result.reason || 'unknown';
         skipReasons.set(reason, (skipReasons.get(reason) || 0) + 1);
-        if (process.env.AUTOMATE_LOG_SKIPPED === '1') {
-          console.log(`⏭️  ${wallet.address.substring(0, 40)}... - ${reason}`);
+        console.log(`${chalk.yellow('↺')} ${chalk.white(label)} ${chalk.gray(reason)}`);
+        if (Array.isArray(result.errors) && result.errors.length) {
+          const lastError = result.errors[result.errors.length - 1];
+          const statusLabel = lastError.status
+            ? `${lastError.status}${lastError.statusText ? ` ${lastError.statusText}` : ''}`
+            : 'n/a';
+          console.log(`    ↳ last error: ${statusLabel}${lastError.message ? ` – ${lastError.message}` : ''}`);
         }
       } else {
-        results.failed++;
-        // Don't log individual failures - only show summary at end
+        results.failed += 1;
+        console.error(`${chalk.red('✖')} ${chalk.white(label)} failed to submit (no details).`);
       }
     }
 
-    // Small delay between batches
     if (i + concurrency < walletsForSubmit.length) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 
-  const step2EndTime = Date.now();
-  const step2Duration = step2EndTime - step2StartTime;
-  const step2Seconds = (step2Duration / 1000).toFixed(2);
-  const step2Minutes = Math.floor(step2Duration / 60000);
-  const step2RemainingSeconds = ((step2Duration % 60000) / 1000).toFixed(2);
+  const step2Duration = Date.now() - step2StartTime;
   timings.submissionMs = step2Duration;
 
-  // Compute generation time display from step1Duration (may be 0 if skipped)
-  const step1Seconds = (step1Duration / 1000).toFixed(2);
-  const step1Minutes = Math.floor(step1Duration / 60000);
-  const step1RemainingSeconds = ((step1Duration % 60000) / 1000).toFixed(2);
+  const totalDuration = step1Duration + step2Duration;
+  const avgHashRate =
+    performance.countedHashRates > 0
+      ? performance.totalHashRate / performance.countedHashRates
+      : null;
 
-  console.log(`\nTiming Summary:`);
-  if (step1Minutes > 0) {
-    console.log(`  Step 1 (Generation): ${step1Minutes}m ${step1RemainingSeconds}s (${step1Duration}ms)`);
-  } else {
-    console.log(`  Step 1 (Generation): ${step1Seconds}s (${step1Duration}ms)`);
-  }
-  if (step2Minutes > 0) {
-    console.log(`  Step 2 (Submission): ${step2Minutes}m ${step2RemainingSeconds}s (${step2Duration}ms)`);
-  } else {
-    console.log(`  Step 2 (Submission): ${step2Seconds}s (${step2Duration}ms)`);
-  }
-  console.log(`\nResults: ${results.success} succeeded (${results.validated} validated), ${results.skipped} skipped, ${results.failed} failed`);
+  logSection('Timing', [
+    ['Generation', formatDuration(step1Duration)],
+    ['Submission', formatDuration(step2Duration)],
+    ['Total', formatDuration(totalDuration)]
+  ]);
+
+  logSection('Results', [
+    ['Wallets processed', meta.walletsForSubmit.toString()],
+    ['Validated', `${results.validated}/${results.success}`],
+    ['Skipped', results.skipped.toString()],
+    ['Failed', results.failed.toString()],
+    ['Hashrate (avg)', formatHashRate(avgHashRate)],
+    ['Hashrate (peak)', formatHashRate(performance.peakHashRate)],
+    ['Hashrate (total)', formatHashRate(performance.totalHashRate)],
+    ['Total hashes', performance.totalHashes ? formatNumber(performance.totalHashes) : '–']
+  ]);
+
   if (skipReasons.size > 0) {
-    console.log('Skip reasons:');
-    for (const [reason, count] of skipReasons.entries()) {
-      console.log(`  - ${reason}: ${count}`);
-    }
+    logSection(
+      'Skip reasons',
+      Array.from(skipReasons.entries()).map(([reason, count]) => [reason, count.toString()])
+    );
   }
-  return { results, timings, meta };
+
+  return {
+    results,
+    timings,
+    meta: {
+      ...meta,
+      totalHashRate: performance.totalHashRate,
+      avgHashRate: avgHashRate,
+      peakHashRate: performance.peakHashRate || null,
+      totalHashes: performance.totalHashes
+    }
+  };
 }
 
 /**
@@ -1358,7 +1493,7 @@ async function main() {
   // Find batch solver binary
   console.log('Looking for batch solver binary...');
   const solverBin = await findSolverBinary('solve-batch');
-  console.log(`Using batch solver: ${solverBin}\n`);
+  console.log(`Using batch solver: ${solverBin.label}\n`);
 
   // Ensure directories exist
   await fs.mkdir(SOLUTIONS_BASE_DIR, { recursive: true });
@@ -1366,7 +1501,11 @@ async function main() {
   // Get current challenge
   console.log('Getting current challenge...');
   const challenge = await getCurrentChallenge();
-  console.log(`Current challenge: ${challenge.challenge.challenge_id || challenge.challenge.challengeId} (${challenge.number})`);
+  const resolvedChallengeId =
+    challenge.challenge.challenge_id || challenge.challenge.challengeId;
+  const resolvedChallengeNumber =
+    challenge.challenge.challenge_number ?? challenge.number ?? 'n/a';
+  console.log(`Current challenge: ${resolvedChallengeId} (${resolvedChallengeNumber})`);
 
   // Get all wallets
   console.log('\nScanning wallets...');
@@ -1417,47 +1556,68 @@ async function main() {
       challenge.challenge.challengeId ||
       (challenge.number !== undefined ? String(challenge.number) : null);
 
-    const automationReport = {
-      challengeId: challengeIdentifier,
-      solutions: {
-        succeded: batchReport.results.success ?? 0,
-        skipped: batchReport.results.skipped ?? 0,
-        failed: batchReport.results.failed ?? 0,
-        validated: batchReport.results.validated ?? 0,
-      },
-      timings: {
-        generationMs: batchReport.timings?.generationMs ?? 0,
-        submissionMs: batchReport.timings?.submissionMs ?? 0,
-      },
-      walletsProcessed: batchReport.meta?.walletsForSubmit ?? wallets.length,
-      timeStamp: reportTimestamp,
-      dataDir: process.env.ASHMAIZE_DATA_DIR ?? DATA_FINAL_DIR,
-    };
+    const didWork = batchReport.meta?.didWork !== false;
+    if (didWork) {
+      const processedWallets = batchReport.meta?.walletsForSubmit ?? wallets.length;
+      const summaryRows = [
+        [
+          'Challenge',
+          `${challengeIdentifier} · Day ${challenge.challenge.day ?? 'n/a'} · #${resolvedChallengeNumber}`
+        ],
+        ['Wallets processed', processedWallets.toString()],
+        ['Validated', `${batchReport.results.validated ?? 0}/${batchReport.results.success ?? 0}`],
+        ['Skipped', (batchReport.results.skipped ?? 0).toString()],
+        ['Failed', (batchReport.results.failed ?? 0).toString()],
+        ['Hashrate (avg)', formatHashRate(batchReport.meta?.avgHashRate)],
+        ['Hashrate (peak)', formatHashRate(batchReport.meta?.peakHashRate)],
+        ['Hashrate (total)', formatHashRate(batchReport.meta?.totalHashRate)],
+        [
+          'Total hashes',
+          batchReport.meta?.totalHashes ? formatNumber(batchReport.meta.totalHashes) : '–'
+        ],
+        ['Gen time', formatDuration(batchReport.timings?.generationMs)],
+        ['Submit time', formatDuration(batchReport.timings?.submissionMs)]
+      ];
+      logSection('Run Summary', summaryRows);
 
-    console.log(`AUTOMATE_SOLVER_RESULT ${JSON.stringify(automationReport)}`);
+      const automationReport = {
+        challengeId: challengeIdentifier,
+        solutions: {
+          succeded: batchReport.results.success ?? 0,
+          skipped: batchReport.results.skipped ?? 0,
+          failed: batchReport.results.failed ?? 0,
+          validated: batchReport.results.validated ?? 0
+        },
+        timings: {
+          generationMs: batchReport.timings?.generationMs ?? 0,
+          submissionMs: batchReport.timings?.submissionMs ?? 0
+        },
+        walletsProcessed: processedWallets,
+        timeStamp: reportTimestamp,
+        dataDir: process.env.ASHMAIZE_DATA_DIR ?? DATA_FINAL_DIR,
+        performance: {
+          totalHashRate: batchReport.meta?.totalHashRate ?? null,
+          avgHashRate: batchReport.meta?.avgHashRate ?? null,
+          peakHashRate: batchReport.meta?.peakHashRate ?? null,
+          totalHashes: batchReport.meta?.totalHashes ?? null
+        }
+      };
 
-    try {
-      await sendDiagnosticsReport(batchReport, challenge.challenge, reportTimestamp);
-    } catch (diagnosticsError) {
-      console.warn(
-        `[${new Date().toISOString()}] Diagnostics dispatch failed: ${diagnosticsError.message}`
-      );
+      console.log(`AUTOMATE_SOLVER_RESULT ${JSON.stringify(automationReport)}`);
+    } else {
+      console.log(chalk.gray('No wallet work required for this challenge run.'));
     }
   }
 
-  // End timing
   const endTime = Date.now();
   const duration = endTime - startTime;
-  const seconds = (duration / 1000).toFixed(2);
-  const minutes = Math.floor(duration / 60000);
-  const remainingSeconds = ((duration % 60000) / 1000).toFixed(2);
-
-  console.log('\n=== Done ===');
-  console.log(`Finished at: ${new Date().toISOString()}`);
-  if (minutes > 0) {
-    console.log(`Total duration: ${minutes}m ${remainingSeconds}s (${duration}ms)`);
+  if (batchReport?.meta?.didWork !== false) {
+    logSection('Run Timing', [
+      ['Finished at', new Date().toISOString()],
+      ['Elapsed', formatDuration(duration)]
+    ]);
   } else {
-    console.log(`Total duration: ${seconds}s (${duration}ms)`);
+    console.log(chalk.gray(`Finished at ${new Date().toISOString()} (${formatDuration(duration)})`));
   }
 }
 
@@ -1465,3 +1625,4 @@ main().catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });
+
